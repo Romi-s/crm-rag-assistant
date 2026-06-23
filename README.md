@@ -1,15 +1,20 @@
-# CRM RAG Assistant — Local Mode (Part 1)
+# CRM RAG Assistant — Local + Amazon Bedrock
 
-A local-first **Retrieval-Augmented Generation** assistant over internal CRM data
-(customers, leads, sales notes, support tickets, email threads, and knowledge
-documents). It answers natural-language questions with **grounded answers and
-source citations**, runs entirely **on your machine with an open-source LLM
-(Ollama) — no AWS, no hosted LLM APIs** — and is built so an **Amazon Bedrock**
-generation mode drops in for Part 2 with a one-line config change.
+A **Retrieval-Augmented Generation** assistant over internal CRM data (customers,
+leads, sales notes, support tickets, email threads, and knowledge documents). It
+answers natural-language questions with **grounded answers and source citations**,
+and runs in two interchangeable modes:
 
-> **Scope of this document:** Part 1 (local RAG). Part 2 (Bedrock) is wired but not
-> yet implemented — see [Bedrock seam](#bedrock-seam-part-2). The provider seam,
-> retrieval, grounding, citations, and observability are all shared between modes.
+- **Local mode** — open-source LLM via **Ollama**, fully on your machine. No AWS, no
+  hosted LLM APIs.
+- **Bedrock mode** — generation via **Amazon Bedrock** (Claude 3 Haiku / Amazon Nova),
+  pay-per-use and cost-controlled.
+
+Switching modes is a **one-line `.env` change** (`LLM_PROVIDER=local|bedrock`).
+Retrieval, grounding, citations, and **local embeddings** are identical in both — so
+**you never re-index when switching**.
+
+> Jump to [Bedrock mode](#bedrock-mode-part-2) for AWS setup, cost estimate, and cleanup.
 
 ---
 
@@ -26,7 +31,7 @@ generation mode drops in for Part 2 with a one-line config change.
 - [Observability & debugging](#observability--debugging)
 - [Security](#security)
 - [Evaluation](#evaluation)
-- [Bedrock seam (Part 2)](#bedrock-seam-part-2)
+- [Bedrock mode (Part 2)](#bedrock-mode-part-2)
 - [Known limitations](#known-limitations)
 - [Future improvements](#future-improvements)
 
@@ -312,29 +317,109 @@ $ python -m eval.eval --retrieval-only
 ... 12/12 passed
 ```
 
-Unit/integration tests (hermetic — no model, no Ollama):
+Unit/integration tests (hermetic — no model, no Ollama, no AWS):
 ```bash
 pip install -r requirements-dev.txt
-pytest -q            # 20 passed
+pytest -q            # 26 passed
 ```
+(Includes Bedrock provider tests with a mocked boto client — success path + AWS error mapping.)
 
 ---
 
-## Bedrock seam (Part 2)
+## Bedrock mode (Part 2)
 
-Generation is abstracted behind `app/providers/base.py::LLMProvider`. Switching modes
-is a config change, not a code change:
+Generation is abstracted behind `app/providers/base.py::LLMProvider`. Switching from
+Ollama to Amazon Bedrock is a **config change, not a code change** — retrieval,
+grounding, citations, and the (local) embeddings are untouched.
 
-```bash
-LLM_PROVIDER=local     # Ollama (this part)
-LLM_PROVIDER=bedrock   # Amazon Bedrock (Part 2 — see app/providers/bedrock.py)
+### Architecture
+
+```
+  question ─► retrieve (hybrid + entity, LOCAL) ─► build prompt ─► Amazon Bedrock
+                                                                    (Converse API,
+                                                                     boto3, on-demand)
+                                                          │
+                       only [system prompt + retrieved excerpts + question] is sent
+                       embeddings + vector store stay LOCAL (nothing else leaves)
 ```
 
-`bedrock.py` already has the interface and the exact `boto3` Converse call sketched
-out; Part 2 fills it in. Because **embeddings stay local**, switching to Bedrock needs
-**no re-indexing**, and only the prompt + retrieved excerpts are sent to AWS (which
-also bounds cost). AWS cost estimate, resources, and cleanup instructions will be
-added with Part 2.
+Bedrock is invoked via the **Converse API** (`app/providers/bedrock.py`), which is
+model-agnostic — the model is just `BEDROCK_MODEL_ID`. It is **serverless and
+on-demand**: no endpoints, no provisioned throughput, nothing running between requests.
+
+### How to run Bedrock mode
+
+1. **Auth — a Bedrock API key (simplest).** Bedrock console → **API keys** → generate
+   one (short-term = 12 h, good for testing; long-term for the demo day). Copy the
+   `bedrock-api-key-…` value.
+2. **`.env`:**
+   ```
+   LLM_PROVIDER=bedrock
+   AWS_REGION=us-east-1
+   BEDROCK_MODEL_ID=anthropic.claude-3-haiku-20240307-v1:0   # or us.amazon.nova-lite-v1:0
+   AWS_BEARER_TOKEN_BEDROCK=bedrock-api-key-...
+   ```
+   `load_dotenv()` exports the token so boto3 picks it up. (Alternative: IAM user access
+   keys via `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` or `aws configure`.)
+3. **Model access:** serverless models auto-enable on first use. **Anthropic/Claude**
+   models need a one-time use-case submission (Bedrock → *Model catalog* → open the
+   model → request access). **Amazon Nova** models have no form (instant).
+4. **Run** — no re-indexing needed:
+   ```bash
+   python -m app.cli ask "Summarize Alpha Trading LLC before my meeting"
+   uvicorn app.main:app --port 8080     # UI badge shows provider=bedrock
+   ```
+   Switch back anytime with `LLM_PROVIDER=local`.
+
+### What data is sent to AWS
+
+Only the constructed prompt: the **system instructions + the handful of retrieved
+excerpts relevant to the question + the user's question**. The full dataset is **not**
+sent, embeddings are computed **locally**, and nothing is sent when the app is idle.
+This satisfies “avoid sending unnecessary data to Bedrock”.
+
+### AWS resources used
+
+| Resource | Type | Standing cost |
+|---|---|---|
+| Amazon Bedrock model invocation | Serverless, pay-per-token | **$0 when idle** |
+| Bedrock API key (bearer token) | Credential | $0 |
+| (optional) AWS Budget alarm | Billing | $0 |
+
+No EC2 / Lambda / S3 / endpoints / provisioned throughput — **nothing always-on**.
+
+### Cost estimate
+
+Bedrock is billed per token; embeddings are local (free). Assumptions: a generous
+**~50 demo questions**, ~2,500 input + ~400 output tokens each.
+
+| Model | Input $/1M | Output $/1M | ~50-question demo | 
+|---|---|---|---|
+| **Claude 3 Haiku** | $0.25 | $1.25 | **≈ $0.06** |
+| Amazon Nova Lite | $0.06 | $0.24 | ≈ $0.01 |
+
+**Well under the €3 limit** — realistically a few cents. Even 500 questions ≈ $0.55.
+The live `Bedrock usage … est_usd=$…` log line shows actual per-call cost. A **$5 AWS
+Budget** alarm is configured as a hard ceiling.
+
+### ⚠️ Cleanup (do after the demo)
+
+- **Delete the Bedrock API key** — Bedrock console → **API keys** → delete it.
+  (Short-term keys also auto-expire after 12 h.) **This is the one credential to remove.**
+- Set `LLM_PROVIDER=local` and remove `AWS_BEARER_TOKEN_BEDROCK` from `.env`.
+- Nothing else to tear down — Bedrock has **no standing resources**. Optionally delete
+  the Budget. (`.env` is git-ignored, so no secret was ever committed.)
+
+### Security (Bedrock mode)
+
+- **No secrets in the repo** — the API key lives only in `.env` (git-ignored).
+- **Scoped permissions** — the Bedrock API key inherits `AmazonBedrockLimitedAccess`
+  (Bedrock only), not account-wide access.
+- **Minimal egress** — only the prompt + retrieved excerpts leave the machine.
+- **Graceful failures** — missing creds, denied model access, wrong region, and
+  throttling each map to a clear `ProviderError` message (see `app/providers/bedrock.py`).
+- **Observability** — token usage + estimated cost are logged per call (no customer
+  data, no secrets).
 
 ---
 
@@ -359,5 +444,5 @@ added with Part 2.
 - A **reranker** (cross-encoder) over the fused candidates for sharper top-k.
 - **Conversation memory** for multi-turn follow-ups.
 - **Injection hardening** — quarantine/scoring of suspicious chunks, output validation.
-- **Bedrock mode** (Part 2) with cost dashboards and cleanup automation.
-```
+- **Bedrock guardrails + cost dashboards** — Amazon Bedrock Guardrails for extra
+  safety, and a CloudWatch usage/cost dashboard.
