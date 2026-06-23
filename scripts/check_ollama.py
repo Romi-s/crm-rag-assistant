@@ -6,6 +6,11 @@ Run this on the machine that will host local generation before the demo.
 """
 
 import sys
+from pathlib import Path
+
+# Make `app` importable when run as `python scripts/check_ollama.py`: put the
+# project root (this file's parent's parent) on the import path.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import requests
 

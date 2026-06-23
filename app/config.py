@@ -12,7 +12,14 @@ The two things worth understanding here:
 
 from typing import Optional
 
+from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
+
+# Export .env into the real process environment. pydantic-settings already reads
+# .env for our OWN fields, but boto3 (Bedrock) reads AWS_* straight from os.environ,
+# so this is what makes AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in .env reach AWS.
+# Does not override variables already set in the real environment.
+load_dotenv()
 
 
 class Settings(BaseSettings):
@@ -28,8 +35,9 @@ class Settings(BaseSettings):
     generation_max_tokens: int = 1024
     generation_temperature: float = 0.1   # low -> stay grounded, less invention
 
-    # Bedrock (Part 2 — settings present so the seam is ready, unused in local mode)
-    aws_region: str = "eu-central-1"
+    # Bedrock (Part 2). Credentials come from the standard AWS chain (env / ~/.aws),
+    # never from this file. us-east-1 has the broadest Bedrock model availability.
+    aws_region: str = "us-east-1"
     bedrock_model_id: str = "anthropic.claude-3-haiku-20240307-v1:0"
 
     # --- Embeddings (always local) --------------------------------------------
