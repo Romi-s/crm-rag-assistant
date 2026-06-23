@@ -83,16 +83,19 @@ class BedrockProvider(LLMProvider):
             )
         except (NoCredentialsError, PartialCredentialsError) as exc:
             raise ProviderError(
-                "AWS credentials not found or incomplete. Set AWS_ACCESS_KEY_ID and "
-                "AWS_SECRET_ACCESS_KEY (in .env or via `aws configure`)."
+                "No AWS credentials found. Set a Bedrock API key as "
+                "AWS_BEARER_TOKEN_BEDROCK in .env (simplest), or AWS_ACCESS_KEY_ID + "
+                "AWS_SECRET_ACCESS_KEY / `aws configure`."
             ) from exc
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
             if code in ("AccessDeniedException", "AccessDenied"):
                 raise ProviderError(
-                    f"Access denied for model '{self.model}' in {self.region}. Either "
-                    "your IAM user is missing `bedrock:InvokeModel`, or model access is "
-                    "not enabled — enable it in Bedrock console → Model access."
+                    f"Access denied for model '{self.model}' in {self.region}. Common "
+                    "causes: (1) first-time Anthropic models need a one-time use-case "
+                    "submission (Bedrock → Model catalog → open the model → request "
+                    "access); (2) the API key/identity lacks bedrock:InvokeModel; "
+                    "(3) the model isn't enabled/available in this region."
                 ) from exc
             if code in ("ResourceNotFoundException", "ValidationException"):
                 raise ProviderError(
